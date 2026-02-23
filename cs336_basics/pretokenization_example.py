@@ -48,6 +48,63 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
+def get_stats(ids):
+    pairs = {}
+    for i in range(1, len(ids)):
+        pair = (ids[i-1], ids[i])
+        pairs[pair] = pairs.get(pair, 0) + 1
+    return pairs
+def merge(ids, merger, new_idx):
+    new_ids = []
+    i = 0
+    
+    while i < len(ids):
+        # Check if we can form a pair
+        if i < len(ids) - 1 and (ids[i], ids[i+1]) == tuple(merger):
+            new_ids.append(new_idx)
+            i += 2  # Skip the next token (since merged)
+        else:
+            new_ids.append(ids[i])
+            i += 1
+    
+    return new_ids
+def BPEtrainer(ids, num_merges):
+    vocab = {i: bytes([i]) for i in range(256)}  # base vocab
+    
+    next_id = 256
+    
+    for _ in range(num_merges):
+        stats = get_stats(ids)
+        
+        # Find most frequent pair
+        curPair = max(stats, key=stats.get)
+        
+        # Add to vocab
+        vocab[next_id] = curPair
+        
+        # Merge in sequence
+        ids = merge(ids, curPair, next_id)
+        
+        next_id += 1
+    
+    return ids, vocab
+def encode(text, vocab):
+    byte_ids = list(text.encode("utf-8"))
+    
+    # Apply merges in order they were learned
+    for new_id in sorted(vocab.keys()):
+        if new_id < 256:
+            continue
+        pair = vocab[new_id]
+        byte_ids = merge(byte_ids, pair, new_id)
+    
+    return byte_idsx
+
+    # do regex 
+
+
+
+    
 
 ## Usage
 with open(..., "rb") as f:
