@@ -68,33 +68,66 @@ class SiluMLP(nn.Module):
         # 4. Project back
         return self.w3(x) # (Batch, Seq_Len, Embed)
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
 class GQA(nn.Module):
-    def __init__(self, seq_len,embed_dim,num_heads=8,heads_kv=4):
+    def __init__(self, dim, n_heads, n_kv_heads):
         super().__init__()
-        self.num_heads = num_heads
-        self.hkv_dim = hkv_dim
-        self.wq = nn.Linear(embed_dim, embed_dim)
-        self.wk = nn.Linear(embed_dim,(num_heads // heads_kv) * embed_dim)
-        self.wv = nn.Linear(embed_dim,(num_heads // heads_kv) * embed_dim)
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.n_rep = n_heads // n_kv_heads # How many Qs per KV
+        self.head_dim = dim // n_heads
+
+        self.wq = nn.Linear(dim, n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * self.head_dim, dim, bias=False)
+
+    def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """Repeat KV heads to match the number of Query heads"""
+        if n_rep == 1:
+            return x
+        bs, n_kv_heads, slen, head_dim = x.shape
+        # This expands the head dimension by n_rep
+        return (
+            x[:, :, None, :, :]
+            .expand(bs, n_kv_heads, n_rep, slen, head_dim)
+            .reshape(bs, n_kv_heads * n_rep, slen, head_dim)
+        )
+
     def forward(self, x):
-        # x: (Batch, Seq_Len, Embed)
-        q = self.wq(x) # (Batch, Seq_Len, Embed)
-        k = self.wk(x) # (Batch, Seq_Len, (Num_Heads // Heads_KV) * Embed)
-        v = self.wv(x) # (Batch, Seq_Len, (Num_Heads // Heads_KV) * Embed)
-        return q, k, v
-    def attention(self, q, k, v):
-        # q: (Batch, Seq_Len, Embed)
-        # k: (Batch, Seq_Len, (Num_Heads // Heads_KV) * Embed)
-        # v: (Batch, Seq_Len, (Num_Heads // Heads_KV) * Embed)
-        batch_size, seq_len, _ = q.size()
-        q = q.view(batch_size, seq_len, self.num_heads, -1).transpose(1, 2) # (Batch, Num_Heads, Seq_Len, Head_Dim)
-        k = k.view(batch_size, seq_len, self.num_heads // self.heads_kv, -1).transpose(1, 2) # (Batch, Num_Heads // Heads_KV, Seq_Len, Head_Dim)
-        v = v.view(batch_size, seq_len, self.num_heads // self.heads_kv, -1).transpose(1, 2) # (Batch, Num_Heads // Heads_KV, Seq_Len, Head_Dim)
-        attn_scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / math.sqrt(q.size(-1)) # (Batch, Num_Heads // Heads_KV, Seq_Len, Seq_Len)
-        attn_weights = torch.softmax(attn_scores, dim=-1) # (Batch, Num_Heads // Heads_KV, Seq_Len, Seq_Len)
-        attn_output = torch.einsum("bhqk,bhvd->bhqd", attn_weights, v) # (Batch, Num_Heads // Heads_KV, Seq_Len, Head_Dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1) # (Batch, Seq_Len, Embed)
-        return attn_output
+        bsz, seqlen, _ = x.shape
+        
+        # 1. Linear Projections
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        # 2. Reshape for Multi-Head (B, H, S, D)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        # 3. THE GQA MAGIC: Repeat KV heads to match Q
+        # xk/xv go from (B, n_kv_heads, S, D) -> (B, n_heads, S, D)
+        keys = self.repeat_kv(xk, self.n_rep)
+        values = self.repeat_kv(xv, self.n_rep)
+
+        # 4. Scaled Dot-Product Attention
+        # Now shapes match: Q(B, 8, S, D) and K(B, 8, S, D)
+        scores = torch.matmul(xq, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        # Causal Mask (Optional but standard for GPT)
+        mask = torch.tril(torch.ones(seqlen, seqlen, device=x.device)).view(1, 1, seqlen, seqlen)
+        scores = scores.masked_fill(mask == 0, float("-inf"))
+        
+        probs = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(probs, values) # (B, n_heads, S, D)
+
+        # 5. Restore original shape
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(output)
         
         
 
